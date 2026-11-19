@@ -25,4 +25,4 @@ $env:QT_QPA_PLATFORM = 'offscreen'
 
 Qt 翻译的 `.ts` 和 `.qm` 都随包分发。修改翻译源文件后，用 `pyside6-lrelease` 重新生成对应的 `.qm`。
 
-[GPLv3 许可证](LICENSE)
+本仓库的原创插件代码采用 [0BSD 许可证](LICENSE)。第三方代码及素材遵循各自的许可证或授权条款。
