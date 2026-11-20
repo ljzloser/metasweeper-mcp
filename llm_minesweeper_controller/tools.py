@@ -33,6 +33,21 @@ READ_ONLY_QUERIES: dict[str, type[BaseQuery]] = {
 CONTROL_TOOLS = frozenset({"click_cell", "start_new_game"})
 
 MAX_BATCH_CLICKS = 128
+GAME_MODES = {
+    "standard": 0,
+    "classic_no_guess": 5,
+    "strict_no_guess": 6,
+    "weak_no_guess": 7,
+    "blessing": 8,
+    "guessable_no_guess": 9,
+    "lucky": 10,
+    "chord_recursive": 11,
+    "flag_recursive": 12,
+    "chord_flag_recursive": 13,
+    "no_guess_chord_recursive": 14,
+    "no_guess_flag_recursive": 15,
+    "no_guess_chord_flag_recursive": 16,
+}
 CLICK_PROPERTIES = {
     "row": {"type": "integer", "minimum": 0},
     "col": {"type": "integer", "minimum": 0},
@@ -62,9 +77,10 @@ TOOLS = [
          "additionalProperties": False},
      "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False,
                      "openWorldHint": False}},
-    {"name": "start_new_game", "description": "Start a game only when no game is in progress; default difficulty medium.",
+    {"name": "start_new_game", "description": "Start a game only when no game is in progress; default difficulty medium and standard mode.",
      "inputSchema": {"type": "object", "properties": {
-         "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"], "default": "medium"}},
+         "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"], "default": "medium"},
+         "mode": {"type": "string", "enum": list(GAME_MODES), "default": "standard"}},
          "additionalProperties": False},
      "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False,
                      "openWorldHint": False}},
@@ -161,14 +177,18 @@ class MinesweeperTools:
             return MouseClickCommand(row=row, col=col, button={"left": 0, "middle": 1, "right": 2}[button],
                                      cells=[(row, col)])
         if name == "start_new_game":
-            if set(arguments) - {"difficulty"}:
-                return failure("Expected optional difficulty only")
+            if set(arguments) - {"difficulty", "mode"}:
+                return failure("Expected optional difficulty and mode only")
             difficulty = arguments.get("difficulty", "medium")
             if not isinstance(difficulty, str) or difficulty not in ("easy", "medium", "hard"):
                 return failure("Unknown difficulty; use easy, medium, or hard")
+            mode = arguments.get("mode", "standard")
+            if not isinstance(mode, str) or mode not in GAME_MODES:
+                return failure("Unknown mode; use one of the advertised game modes")
             if self.status not in (1, 3, 4) or self.board is None:
                 return failure("Cannot replace a playing, unknown, or unavailable game")
-            return NewGameCommand(level={"easy": 3, "medium": 4, "hard": 5}[difficulty])
+            return NewGameCommand(level={"easy": 3, "medium": 4, "hard": 5}[difficulty],
+                                  mode=GAME_MODES[mode])
         return failure("Unknown tool")
 
     def _live_snapshot(self, name: str, result: BaseQueryResult) -> dict | None:

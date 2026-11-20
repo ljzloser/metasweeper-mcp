@@ -18,6 +18,12 @@ PROTOCOL_VERSION = "2025-11-25"
 TERMINAL = {"win", "jowin", "lose", "fail", "jofail", "finished"}
 ACTIVE = {"playing", "joking"}
 READY = {"ready"}
+GAME_MODES = (
+    "standard", "classic_no_guess", "strict_no_guess", "weak_no_guess",
+    "blessing", "guessable_no_guess", "lucky", "chord_recursive",
+    "flag_recursive", "chord_flag_recursive", "no_guess_chord_recursive",
+    "no_guess_flag_recursive", "no_guess_chord_flag_recursive",
+)
 
 
 class McpClient:
@@ -161,12 +167,13 @@ def read_live_board(client: McpClient, retries: int = 20) -> dict:
     raise RuntimeError(f"could not get a stable live board after {retries} reads: {last_result}")
 
 
-def run_game(client: McpClient, difficulty: str, rng: random.Random, max_steps: int) -> str:
+def run_game(client: McpClient, difficulty: str, mode: str,
+             rng: random.Random, max_steps: int) -> str:
     current = client.call("get_game_status")
     current_status = board_status(current)
     first_click = False
     if current_status in READY or current_status in TERMINAL or current_status == "unknown":
-        started = client.call("start_new_game", {"difficulty": difficulty})
+        started = client.call("start_new_game", {"difficulty": difficulty, "mode": mode})
         if not started.get("success"):
             raise RuntimeError(f"start_new_game failed: {started}")
         print("started", difficulty, flush=True)
@@ -234,6 +241,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--games", type=int, default=0, help="0 means continue until Ctrl+C")
     parser.add_argument("--difficulty", choices=("easy", "medium", "hard"), default="easy")
+    parser.add_argument("--mode", choices=GAME_MODES, default="standard")
     parser.add_argument("--delay", type=float, default=0.05)
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=None)
@@ -244,7 +252,7 @@ def main() -> int:
     completed = 0
     try:
         while args.games == 0 or completed < args.games:
-            run_game(client, args.difficulty, rng, args.max_steps)
+            run_game(client, args.difficulty, args.mode, rng, args.max_steps)
             completed += 1
             time.sleep(args.delay)
     except KeyboardInterrupt:

@@ -62,7 +62,7 @@ if isinstance(result, BoardStateResult) and result.success:
 | `get_game_status` | 无 | 主动请求状态、计时、剩余雷数与局面参数；失败时回退到缓存 |
 | `get_game_context` | 无 | 主动请求状态、参数、3BV 进度、官方/公平标志与当前已开启的控制权限 |
 | `click_cell` | `clicks` 数组和批次级 `button`，或单个 `row`, `col`, `button` | 单次最多 128 项；行列从零开始；按钮限 `left`、`middle`、`right` |
-| `start_new_game` | `difficulty="medium"` | 难度限 `easy`、`medium`、`hard` |
+| `start_new_game` | `difficulty="medium"`, `mode="standard"` | 难度限 `easy`、`medium`、`hard`；模式可选 `strict_no_guess` 等已公布模式 |
 
 ### 批量点击
 

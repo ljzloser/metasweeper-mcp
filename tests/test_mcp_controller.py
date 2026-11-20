@@ -778,6 +778,22 @@ def test_new_game_and_no_automatic_restart(sdk, difficulty, level):
     assert not sdk.registry.execute_function("start_new_game", {})["success"]
 
 
+def test_start_new_game_supports_strict_no_guess_mode(sdk):
+    set_board(sdk.registry, 3)
+    result = sdk.registry.execute_function("start_new_game", {
+        "difficulty": "hard", "mode": "strict_no_guess"})
+    assert result["success"]
+    assert isinstance(sdk.calls[0], NewGameCommand)
+    assert sdk.calls[0].level == 5 and sdk.calls[0].mode == 6
+
+
+def test_start_new_game_rejects_unknown_mode_without_sending(sdk):
+    set_board(sdk.registry, 3)
+    result = sdk.registry.execute_function("start_new_game", {"mode": "mystery"})
+    assert not result["success"]
+    assert not sdk.calls
+
+
 @pytest.mark.parametrize("status", [None, 0, 2, 5, 6, 7, 8, 99])
 def test_never_overwrite_active_or_unknown_game(sdk, status):
     set_board(sdk.registry)
