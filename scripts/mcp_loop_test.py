@@ -2,14 +2,16 @@
 """Run continuous end-to-end games through the local Metasweeper MCP service.
 
 The script uses only MCP HTTP tools. It starts games, reads the visible board,
-flags cells proved to be mines, opens cells proved safe, and guesses when the
-visible information is insufficient. It never reads hidden board data.
+flags cells proved to be mines, and opens cells proved safe. Standard mode may
+use a random guess when the visible information is insufficient; no-guess modes
+never do so. It never reads hidden board data.
 """
 from __future__ import annotations
 
 import argparse
 import http.client
 import json
+import math
 import random
 import time
 from typing import Any
@@ -24,6 +26,26 @@ GAME_MODES = (
     "flag_recursive", "chord_flag_recursive", "no_guess_chord_recursive",
     "no_guess_flag_recursive", "no_guess_chord_flag_recursive",
 )
+GAME_MODE_VALUES = {
+    "standard": 0,
+    "classic_no_guess": 5,
+    "strict_no_guess": 6,
+    "weak_no_guess": 7,
+    "blessing": 8,
+    "guessable_no_guess": 9,
+    "lucky": 10,
+    "chord_recursive": 11,
+    "flag_recursive": 12,
+    "chord_flag_recursive": 13,
+    "no_guess_chord_recursive": 14,
+    "no_guess_flag_recursive": 15,
+    "no_guess_chord_flag_recursive": 16,
+}
+NO_GUESS_MODES = frozenset({
+    "classic_no_guess", "strict_no_guess", "weak_no_guess", "blessing",
+    "no_guess_chord_recursive",
+    "no_guess_flag_recursive", "no_guess_chord_flag_recursive",
+})
 
 
 class McpClient:
@@ -119,25 +141,385 @@ def neighbors(row: int, col: int, rows: int, cols: int):
                     yield nr, nc
 
 
-def deductions(cells: list[list[Any]]) -> tuple[set[tuple[int, int]], set[tuple[int, int]]]:
+def _build_constraints(
+        cells: list[list[Any]],
+) -> tuple[list[tuple[frozenset[tuple[int, int]], int]], set[tuple[int, int]]]:
     rows, cols = len(cells), len(cells[0])
-    safe: set[tuple[int, int]] = set()
-    mines: set[tuple[int, int]] = set()
+    constraints: list[tuple[frozenset[tuple[int, int]], int]] = []
+    unknown_cells = {
+        (row, col)
+        for row, values in enumerate(cells)
+        for col, value in enumerate(values)
+        if value == -1
+    }
     for row in range(rows):
         for col in range(cols):
             value = cells[row][col]
             if type(value) is not int or not 0 <= value <= 8:
                 continue
             around = list(neighbors(row, col, rows, cols))
-            hidden = [(r, c) for r, c in around if cells[r][c] == -1]
+            hidden = frozenset((r, c) for r, c in around if cells[r][c] == -1)
             flagged = sum(cells[r][c] == "F" for r, c in around)
             remaining = value - flagged
-            if hidden and remaining == 0:
-                safe.update(hidden)
-            elif hidden and remaining == len(hidden):
-                mines.update(hidden)
+            if hidden and 0 <= remaining <= len(hidden):
+                constraints.append((hidden, remaining))
+    return constraints, unknown_cells
+
+
+def deductions(cells: list[list[Any]], mines_remaining: int | None = None
+               ) -> tuple[set[tuple[int, int]], set[tuple[int, int]]]:
+    """Find cells forced safe/mine by local and subset constraint rules."""
+    safe: set[tuple[int, int]] = set()
+    mines: set[tuple[int, int]] = set()
+    constraints, unknown_cells = _build_constraints(cells)
+
+    # Repeatedly apply direct rules and A⊂B subtraction. This handles cases
+    # where no single number has a complete mine/safe neighborhood but the
+    # visible equations still force a result.
+    changed = True
+    while changed:
+        changed = False
+        for unknown, remaining in constraints:
+            unresolved = unknown - safe - mines
+            remaining -= len(unknown & mines)
+            if not unresolved or remaining < 0 or remaining > len(unresolved):
+                continue
+            if remaining == 0:
+                before = len(safe)
+                safe.update(unresolved)
+                changed |= len(safe) != before
+            elif remaining == len(unresolved):
+                before = len(mines)
+                mines.update(unresolved)
+                changed |= len(mines) != before
+        for index, (left_cells, left_remaining) in enumerate(constraints):
+            left_cells = left_cells - safe - mines
+            left_remaining -= len(constraints[index][0] & mines)
+            if not left_cells or left_remaining < 0:
+                continue
+            for right_original_cells, right_original_remaining in constraints[index + 1:]:
+                right_cells = right_original_cells
+                right_remaining = right_original_remaining
+                right_cells = right_cells - safe - mines
+                right_remaining -= len(right_original_cells & mines)
+                if left_cells < right_cells:
+                    subset, superset = left_cells, right_cells
+                    difference = right_remaining - left_remaining
+                elif right_cells < left_cells:
+                    subset, superset = right_cells, left_cells
+                    difference = left_remaining - right_remaining
+                else:
+                    continue
+                new_cells = superset - subset
+                if not new_cells or difference < 0 or difference > len(new_cells):
+                    continue
+                if difference == 0:
+                    before = len(safe)
+                    safe.update(new_cells)
+                    changed |= len(safe) != before
+                elif difference == len(new_cells):
+                    before = len(mines)
+                    mines.update(new_cells)
+                    changed |= len(mines) != before
+
+        # If subtraction still leaves an ambiguous frontier, enumerate each
+        # small connected component. A no-guess board can require this global
+        # constraint step even though every individual number is ambiguous.
+        forced_safe, forced_mines = _enumerated_forced_cells(
+            constraints, safe, mines)
+        before_safe, before_mines = len(safe), len(mines)
+        safe.update(forced_safe)
+        mines.update(forced_mines)
+        changed |= len(safe) != before_safe or len(mines) != before_mines
+    if isinstance(mines_remaining, int) and mines_remaining >= 0:
+        global_safe, global_mines = _global_csp_forced_cells(
+            constraints, safe, mines, mines_remaining,
+            unknown_cells)
+        safe.update(global_safe)
+        mines.update(global_mines)
     safe.difference_update(mines)
     return safe, mines
+
+
+def exact_probabilities(cells: list[list[Any]], mines_remaining: int
+                        ) -> dict[tuple[int, int], float]:
+    """Return exact frontier probabilities when the component search fits."""
+    constraints, unknown_cells = _build_constraints(cells)
+    _, _, probabilities = _global_csp_forced_cells(
+        constraints, set(), set(), mines_remaining, unknown_cells,
+        with_probabilities=True)
+    return probabilities
+
+
+def _enumerated_forced_cells(
+        constraints: list[tuple[frozenset[tuple[int, int]], int]],
+        safe: set[tuple[int, int]],
+        mines: set[tuple[int, int]],
+        max_variables: int = 20,
+) -> tuple[set[tuple[int, int]], set[tuple[int, int]]]:
+    """Return cells fixed in every assignment satisfying each frontier.
+
+    Components larger than ``max_variables`` are skipped to keep the tester
+    bounded on large boards. They remain eligible for the subset rules above.
+    """
+    active: list[tuple[frozenset[tuple[int, int]], int]] = []
+    for original_cells, original_remaining in constraints:
+        unknown = original_cells - safe - mines
+        remaining = original_remaining - len(original_cells & mines)
+        if unknown and 0 <= remaining <= len(unknown):
+            active.append((frozenset(unknown), remaining))
+    if not active:
+        return set(), set()
+
+    variable_to_constraints: dict[tuple[int, int], set[int]] = {}
+    for index, (unknown, _) in enumerate(active):
+        for cell in unknown:
+            variable_to_constraints.setdefault(cell, set()).add(index)
+
+    safe_result: set[tuple[int, int]] = set()
+    mines_result: set[tuple[int, int]] = set()
+    visited: set[int] = set()
+    for start in range(len(active)):
+        if start in visited:
+            continue
+        component_constraints: set[int] = {start}
+        queue = [start]
+        visited.add(start)
+        while queue:
+            index = queue.pop()
+            for cell in active[index][0]:
+                for adjacent in variable_to_constraints[cell]:
+                    if adjacent not in visited:
+                        visited.add(adjacent)
+                        component_constraints.add(adjacent)
+                        queue.append(adjacent)
+        variables = sorted({cell for index in component_constraints for cell in active[index][0]})
+        if len(variables) > max_variables:
+            continue
+        positions = {cell: offset for offset, cell in enumerate(variables)}
+        encoded = [
+            ([positions[cell] for cell in unknown], remaining)
+            for index in component_constraints
+            for unknown, remaining in [active[index]]
+        ]
+        possible_masks: list[int] = []
+        for mask in range(1 << len(variables)):
+            if all(sum((mask >> position) & 1 for position in positions_list) == remaining
+                   for positions_list, remaining in encoded):
+                possible_masks.append(mask)
+        if not possible_masks:
+            continue
+        for offset, cell in enumerate(variables):
+            values = {(mask >> offset) & 1 for mask in possible_masks}
+            if values == {0}:
+                safe_result.add(cell)
+            elif values == {1}:
+                mines_result.add(cell)
+    return safe_result, mines_result
+
+
+def _enumerate_component(
+        variables: list[tuple[int, int]],
+        constraints: list[tuple[frozenset[tuple[int, int]], int]],
+        max_nodes: int = 400_000,
+) -> dict[int, list[int]] | None:
+    """Enumerate valid masks for one independent constraint component.
+
+    The search branches on high-degree cells first and prunes every partial
+    assignment whose constraint can no longer reach its required mine count.
+    ``None`` means the component exceeded the bounded search budget.
+    """
+    if len(variables) > 24:
+        return None
+    positions = {cell: index for index, cell in enumerate(variables)}
+    encoded = [
+        ([positions[cell] for cell in unknown], remaining)
+        for unknown, remaining in constraints
+    ]
+    occurrences = [0] * len(variables)
+    for positions_list, _ in encoded:
+        for position in positions_list:
+            occurrences[position] += 1
+    order = sorted(range(len(variables)), key=lambda position: -occurrences[position])
+    constraint_by_position: list[list[int]] = [[] for _ in variables]
+    for index, (positions_list, _) in enumerate(encoded):
+        for position in positions_list:
+            constraint_by_position[position].append(index)
+    assigned_mines = [0] * len(encoded)
+    unassigned = [len(positions_list) for positions_list, _ in encoded]
+    assignment = [0] * len(variables)
+    result: dict[int, list[int]] = {}
+    nodes = 0
+
+    def search(depth: int) -> bool:
+        nonlocal nodes
+        nodes += 1
+        if nodes > max_nodes:
+            return False
+        if depth == len(order):
+            mask = sum(value << position for position, value in enumerate(assignment))
+            result.setdefault(sum(assignment), []).append(mask)
+            return True
+        position = order[depth]
+        for value in (0, 1):
+            touched = constraint_by_position[position]
+            valid = True
+            assignment[position] = value
+            for index in touched:
+                assigned_mines[index] += value
+                unassigned[index] -= 1
+                _, required = encoded[index]
+                if (assigned_mines[index] > required
+                        or assigned_mines[index] + unassigned[index] < required):
+                    valid = False
+            if valid and not search(depth + 1):
+                return False
+            for index in touched:
+                assigned_mines[index] -= value
+                unassigned[index] += 1
+            assignment[position] = 0
+        return True
+
+    if not search(0):
+        return None
+    return result
+
+
+def _global_csp_forced_cells(
+        constraints: list[tuple[frozenset[tuple[int, int]], int]],
+        safe: set[tuple[int, int]],
+        mines: set[tuple[int, int]],
+        mines_remaining: int,
+        unknown_cells: set[tuple[int, int]],
+        with_probabilities: bool = False,
+) -> tuple[set[tuple[int, int]], set[tuple[int, int]]] | tuple[
+        set[tuple[int, int]], set[tuple[int, int]], dict[tuple[int, int], float]]:
+    """Use exact component models plus the global remaining-mine count.
+
+    This combines independent frontiers and unconstrained covered cells. A
+    cell is returned only when every globally valid board assigns it the same
+    value, so it is safe for no-guess play.
+    """
+    active: list[tuple[frozenset[tuple[int, int]], int]] = []
+    for original_cells, original_remaining in constraints:
+        unresolved = original_cells - safe - mines
+        remaining = original_remaining - len(original_cells & mines)
+        if unresolved and 0 <= remaining <= len(unresolved):
+            active.append((frozenset(unresolved), remaining))
+    if not active:
+        if not unknown_cells or not 0 <= mines_remaining <= len(unknown_cells):
+            return (set(), set(), {}) if with_probabilities else (set(), set())
+        probability = mines_remaining / len(unknown_cells)
+        safe_result = set(unknown_cells) if mines_remaining == 0 else set()
+        mines_result = set(unknown_cells) if mines_remaining == len(unknown_cells) else set()
+        probabilities = {cell: probability for cell in unknown_cells}
+        if with_probabilities:
+            return safe_result, mines_result, probabilities
+        return safe_result, mines_result
+    variable_to_constraints: dict[tuple[int, int], set[int]] = {}
+    for index, (unknown, _) in enumerate(active):
+        for cell in unknown:
+            variable_to_constraints.setdefault(cell, set()).add(index)
+    components: list[tuple[list[tuple[int, int]], dict[int, list[int]]]] = []
+    visited: set[int] = set()
+    frontier: set[tuple[int, int]] = set()
+    for start in range(len(active)):
+        if start in visited:
+            continue
+        component_constraints: set[int] = {start}
+        queue = [start]
+        visited.add(start)
+        while queue:
+            index = queue.pop()
+            for cell in active[index][0]:
+                frontier.add(cell)
+                for adjacent in variable_to_constraints[cell]:
+                    if adjacent not in visited:
+                        visited.add(adjacent)
+                        component_constraints.add(adjacent)
+                        queue.append(adjacent)
+        variables = sorted({cell for index in component_constraints for cell in active[index][0]})
+        local_constraints = [active[index] for index in component_constraints]
+        models = _enumerate_component(variables, local_constraints)
+        if models is None or not models:
+            return (set(), set(), {}) if with_probabilities else (set(), set())
+        components.append((variables, models))
+
+    # Prefix/suffix distributions let us condition each component on the
+    # exact total mine count without enumerating Cartesian products.
+    distributions = [{count: len(masks) for count, masks in models.items()}
+                      for _, models in components]
+    prefix: list[dict[int, int]] = [{0: 1}]
+    for distribution in distributions:
+        merged: dict[int, int] = {}
+        for left_count, left_ways in prefix[-1].items():
+            for right_count, right_ways in distribution.items():
+                total = left_count + right_count
+                merged[total] = merged.get(total, 0) + left_ways * right_ways
+        prefix.append(merged)
+    suffix: list[dict[int, int]] = [{} for _ in range(len(components) + 1)]
+    suffix[-1] = {0: 1}
+    for index in range(len(components) - 1, -1, -1):
+        merged = {}
+        for left_count, left_ways in distributions[index].items():
+            for right_count, right_ways in suffix[index + 1].items():
+                total = left_count + right_count
+                merged[total] = merged.get(total, 0) + left_ways * right_ways
+        suffix[index] = merged
+    unconstrained_cells = unknown_cells - frontier - safe - mines
+    unconstrained = len(unconstrained_cells)
+    total_ways = 0
+    for component_count, ways in prefix[-1].items():
+        remaining = mines_remaining - component_count
+        if 0 <= remaining <= unconstrained:
+            total_ways += ways * math.comb(unconstrained, remaining)
+    if total_ways == 0:
+        return (set(), set(), {}) if with_probabilities else (set(), set())
+
+    forced_safe: set[tuple[int, int]] = set()
+    forced_mines: set[tuple[int, int]] = set()
+    probabilities: dict[tuple[int, int], float] = {}
+    for index, (variables, models) in enumerate(components):
+        other_distribution: dict[int, int] = {}
+        for left_count, left_ways in prefix[index].items():
+            for right_count, right_ways in suffix[index + 1].items():
+                total = left_count + right_count
+                other_distribution[total] = other_distribution.get(total, 0) + left_ways * right_ways
+        model_weight: dict[int, int] = {}
+        for component_count in models:
+            weight = 0
+            for other_count, other_ways in other_distribution.items():
+                remaining = mines_remaining - component_count - other_count
+                if 0 <= remaining <= unconstrained:
+                    weight += other_ways * math.comb(unconstrained, remaining)
+            model_weight[component_count] = weight
+        for position, cell in enumerate(variables):
+            mine_ways = 0
+            for component_count, masks in models.items():
+                weight = model_weight[component_count]
+                mine_ways += sum((mask >> position) & 1 for mask in masks) * weight
+            if mine_ways == 0:
+                forced_safe.add(cell)
+            elif mine_ways == total_ways:
+                forced_mines.add(cell)
+            probabilities[cell] = mine_ways / total_ways
+
+    if unconstrained:
+        unconstrained_mine_ways = 0
+        for component_count, ways in prefix[-1].items():
+            remaining = mines_remaining - component_count
+            if 1 <= remaining <= unconstrained:
+                unconstrained_mine_ways += ways * math.comb(unconstrained - 1, remaining - 1)
+        if unconstrained_mine_ways == 0:
+            forced_safe.update(unconstrained_cells)
+        elif unconstrained_mine_ways == total_ways:
+            forced_mines.update(unconstrained_cells)
+        unconstrained_probability = unconstrained_mine_ways / total_ways
+        for cell in unconstrained_cells:
+            probabilities[cell] = unconstrained_probability
+    if with_probabilities:
+        return forced_safe, forced_mines, probabilities
+    return forced_safe, forced_mines
 
 
 def board_status(snapshot: dict) -> str:
@@ -172,6 +554,12 @@ def run_game(client: McpClient, difficulty: str, mode: str,
     current = client.call("get_game_status")
     current_status = board_status(current)
     first_click = False
+    current_mode = current.get("mode")
+    expected_mode = GAME_MODE_VALUES.get(mode)
+    if current_status in ACTIVE and expected_mode is not None and current_mode != expected_mode:
+        raise RuntimeError(
+            f"active game mode is {current_mode!r}, requested {mode!r}; "
+            "finish or restart the current game before running the tester")
     if current_status in READY or current_status in TERMINAL or current_status == "unknown":
         started = client.call("start_new_game", {"difficulty": difficulty, "mode": mode})
         if not started.get("success"):
@@ -203,7 +591,7 @@ def run_game(client: McpClient, difficulty: str, mode: str,
                 raise RuntimeError(f"initial click failed: {result}")
             first_click = False
             continue
-        safe, mines = deductions(cells)
+        safe, mines = deductions(cells, snapshot.get("mines_remaining"))
         unknown = [(r, c) for r in range(rows) for c in range(cols) if cells[r][c] == -1]
         if mines:
             result = client.call("click_cell", {"clicks": [{"row": r, "col": c} for r, c in sorted(mines)], "button": "right"})
@@ -224,8 +612,20 @@ def run_game(client: McpClient, difficulty: str, mode: str,
         if not unknown:
             time.sleep(0.15)
             continue
-        target = rng.choice(unknown)
-        print("guess", target, "step", step, flush=True)
+        if mode in NO_GUESS_MODES:
+            raise RuntimeError(
+                f"no forced move at step {step} in {mode}; refusing to guess")
+        probabilities = exact_probabilities(
+            cells, snapshot.get("mines_remaining", -1))
+        candidates = [cell for cell in unknown if cell in probabilities]
+        if candidates:
+            target = min(candidates, key=probabilities.__getitem__)
+            print("probability guess", target,
+                  f"mine-risk={probabilities[target]:.6f}",
+                  "step", step, flush=True)
+        else:
+            target = rng.choice(unknown)
+            print("fallback guess", target, "step", step, flush=True)
         result = client.call("click_cell", {"clicks": [{"row": target[0], "col": target[1]}], "button": "left"})
         if not result.get("success"):
             if transient_batch_failure(result):
