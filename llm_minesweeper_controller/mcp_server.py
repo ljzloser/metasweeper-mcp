@@ -587,7 +587,7 @@ class _Handler(BaseHTTPRequestHandler):
                 owner.session_activity[session] = now
             self._reply(200, {"jsonrpc": "2.0", "id": request_id, "result": {
                 "protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "metasweeper-mcp", "version": "2.0.6"}}},
+                "serverInfo": {"name": "metasweeper-mcp", "version": "2.0.7"}}},
                 {"Mcp-Session-Id": session})
             return
         session = self.headers.get("Mcp-Session-Id", "")

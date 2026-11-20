@@ -2,9 +2,10 @@
 """Run continuous end-to-end games through the local Metasweeper MCP service.
 
 The script uses only MCP HTTP tools. It starts games, reads the visible board,
-flags cells proved to be mines, and opens cells proved safe. Standard mode may
-use a random guess when the visible information is insufficient; no-guess modes
-never do so. It never reads hidden board data.
+tracks cells proved to be mines, and opens cells proved safe. Physical flags
+are opt-in with --flag-mines. Standard mode may use a probability-guided guess
+when the visible information is insufficient; no-guess modes never do so. It
+never reads hidden board data.
 """
 from __future__ import annotations
 
@@ -143,14 +144,16 @@ def neighbors(row: int, col: int, rows: int, cols: int):
 
 def _build_constraints(
         cells: list[list[Any]],
+        known_mines: set[tuple[int, int]] | None = None,
 ) -> tuple[list[tuple[frozenset[tuple[int, int]], int]], set[tuple[int, int]]]:
     rows, cols = len(cells), len(cells[0])
+    known_mines = known_mines or set()
     constraints: list[tuple[frozenset[tuple[int, int]], int]] = []
     unknown_cells = {
         (row, col)
         for row, values in enumerate(cells)
         for col, value in enumerate(values)
-        if value == -1
+        if value == -1 and (row, col) not in known_mines
     }
     for row in range(rows):
         for col in range(cols):
@@ -158,20 +161,26 @@ def _build_constraints(
             if type(value) is not int or not 0 <= value <= 8:
                 continue
             around = list(neighbors(row, col, rows, cols))
-            hidden = frozenset((r, c) for r, c in around if cells[r][c] == -1)
-            flagged = sum(cells[r][c] == "F" for r, c in around)
+            hidden = frozenset(
+                (r, c) for r, c in around
+                if cells[r][c] == -1 and (r, c) not in known_mines)
+            flagged = sum(
+                cells[r][c] == "F" or (r, c) in known_mines
+                for r, c in around)
             remaining = value - flagged
             if hidden and 0 <= remaining <= len(hidden):
                 constraints.append((hidden, remaining))
     return constraints, unknown_cells
 
 
-def deductions(cells: list[list[Any]], mines_remaining: int | None = None
+def deductions(cells: list[list[Any]], mines_remaining: int | None = None,
+               known_mines: set[tuple[int, int]] | None = None
                ) -> tuple[set[tuple[int, int]], set[tuple[int, int]]]:
     """Find cells forced safe/mine by local and subset constraint rules."""
     safe: set[tuple[int, int]] = set()
     mines: set[tuple[int, int]] = set()
-    constraints, unknown_cells = _build_constraints(cells)
+    known_mines = known_mines or set()
+    constraints, unknown_cells = _build_constraints(cells, known_mines)
 
     # Repeatedly apply direct rules and A⊂B subtraction. This handles cases
     # where no single number has a complete mine/safe neighborhood but the
@@ -225,12 +234,15 @@ def deductions(cells: list[list[Any]], mines_remaining: int | None = None
         # If subtraction still leaves an ambiguous frontier, enumerate each
         # small connected component. A no-guess board can require this global
         # constraint step even though every individual number is ambiguous.
-        forced_safe, forced_mines = _enumerated_forced_cells(
-            constraints, safe, mines)
-        before_safe, before_mines = len(safe), len(mines)
-        safe.update(forced_safe)
-        mines.update(forced_mines)
-        changed |= len(safe) != before_safe or len(mines) != before_mines
+        # Once a forced action exists, return it immediately and avoid paying
+        # the enumeration cost on every ordinary board update.
+        if not safe and not mines:
+            forced_safe, forced_mines = _enumerated_forced_cells(
+                constraints, safe, mines)
+            before_safe, before_mines = len(safe), len(mines)
+            safe.update(forced_safe)
+            mines.update(forced_mines)
+            changed |= len(safe) != before_safe or len(mines) != before_mines
     if isinstance(mines_remaining, int) and mines_remaining >= 0:
         global_safe, global_mines = _global_csp_forced_cells(
             constraints, safe, mines, mines_remaining,
@@ -241,10 +253,11 @@ def deductions(cells: list[list[Any]], mines_remaining: int | None = None
     return safe, mines
 
 
-def exact_probabilities(cells: list[list[Any]], mines_remaining: int
+def exact_probabilities(cells: list[list[Any]], mines_remaining: int,
+                        known_mines: set[tuple[int, int]] | None = None
                         ) -> dict[tuple[int, int], float]:
     """Return exact frontier probabilities when the component search fits."""
-    constraints, unknown_cells = _build_constraints(cells)
+    constraints, unknown_cells = _build_constraints(cells, known_mines)
     _, _, probabilities = _global_csp_forced_cells(
         constraints, set(), set(), mines_remaining, unknown_cells,
         with_probabilities=True)
@@ -550,7 +563,7 @@ def read_live_board(client: McpClient, retries: int = 20) -> dict:
 
 
 def run_game(client: McpClient, difficulty: str, mode: str,
-             rng: random.Random, max_steps: int) -> str:
+             rng: random.Random, max_steps: int, flag_mines: bool = False) -> str:
     current = client.call("get_game_status")
     current_status = board_status(current)
     first_click = False
@@ -568,6 +581,7 @@ def run_game(client: McpClient, difficulty: str, mode: str,
         first_click = True
     else:
         print("continuing", current_status, flush=True)
+    known_mines: set[tuple[int, int]] = set()
     for step in range(1, max_steps + 1):
         snapshot = read_live_board(client)
         status = board_status(snapshot)
@@ -591,9 +605,18 @@ def run_game(client: McpClient, difficulty: str, mode: str,
                 raise RuntimeError(f"initial click failed: {result}")
             first_click = False
             continue
-        safe, mines = deductions(cells, snapshot.get("mines_remaining"))
-        unknown = [(r, c) for r in range(rows) for c in range(cols) if cells[r][c] == -1]
-        if mines:
+        reported_mines = snapshot.get("mines_remaining")
+        mines_remaining = (
+            reported_mines - len(known_mines)
+            if isinstance(reported_mines, int) else None)
+        safe, mines = deductions(cells, mines_remaining, known_mines)
+        new_mines = mines - known_mines
+        if not flag_mines:
+            known_mines.update(mines)
+        unknown = [
+            (r, c) for r in range(rows) for c in range(cols)
+            if cells[r][c] == -1 and (r, c) not in known_mines]
+        if flag_mines and mines:
             result = client.call("click_cell", {"clicks": [{"row": r, "col": c} for r, c in sorted(mines)], "button": "right"})
             if not result.get("success"):
                 if transient_batch_failure(result):
@@ -609,6 +632,10 @@ def run_game(client: McpClient, difficulty: str, mode: str,
                     continue
                 raise RuntimeError(f"safe batch failed: {result}")
             continue
+        if not flag_mines and new_mines:
+            # Virtual mines change the equations without requiring a right
+            # click; recompute against the same visible board immediately.
+            continue
         if not unknown:
             time.sleep(0.15)
             continue
@@ -616,7 +643,8 @@ def run_game(client: McpClient, difficulty: str, mode: str,
             raise RuntimeError(
                 f"no forced move at step {step} in {mode}; refusing to guess")
         probabilities = exact_probabilities(
-            cells, snapshot.get("mines_remaining", -1))
+            cells, mines_remaining if mines_remaining is not None else -1,
+            known_mines)
         candidates = [cell for cell in unknown if cell in probabilities]
         if candidates:
             target = min(candidates, key=probabilities.__getitem__)
@@ -642,7 +670,10 @@ def main() -> int:
     parser.add_argument("--games", type=int, default=0, help="0 means continue until Ctrl+C")
     parser.add_argument("--difficulty", choices=("easy", "medium", "hard"), default="easy")
     parser.add_argument("--mode", choices=GAME_MODES, default="standard")
-    parser.add_argument("--delay", type=float, default=0.05)
+    parser.add_argument("--delay", type=float, default=0.0,
+                        help="pause between completed games (default: 0)")
+    parser.add_argument("--flag-mines", action="store_true",
+                        help="physically right-click proven mines; default is left-click-only")
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
@@ -652,7 +683,8 @@ def main() -> int:
     completed = 0
     try:
         while args.games == 0 or completed < args.games:
-            run_game(client, args.difficulty, args.mode, rng, args.max_steps)
+            run_game(client, args.difficulty, args.mode, rng, args.max_steps,
+                     args.flag_mines)
             completed += 1
             time.sleep(args.delay)
     except KeyboardInterrupt:
