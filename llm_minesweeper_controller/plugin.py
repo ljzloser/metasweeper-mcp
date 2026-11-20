@@ -52,7 +52,7 @@ class LlmMinesweeperControllerPlugin(BasePlugin[LlmMinesweeperControllerConfig])
             # name 是配置目录、日志、状态键与授权记录的稳定标识，不随语言变化
             name="元扫雷 MCP 服务",
             display_name=_translate("MinesweeperMcp", "元扫雷 MCP 服务"),
-            version="2.0.2",
+            version="2.0.3",
             description=_translate("MinesweeperMcp", "通过本机 MCP 服务提供可见棋盘和经授权的辅助操作"),
             # 默认不自动开启界面；只在启动时读取，不与窗口生命周期联动。
             show_window=False,
