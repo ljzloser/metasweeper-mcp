@@ -168,7 +168,7 @@ def _build_constraints(
                 cells[r][c] == "F" or (r, c) in known_mines
                 for r, c in around)
             remaining = value - flagged
-            if hidden and 0 <= remaining <= len(hidden):
+            if hidden:
                 constraints.append((hidden, remaining))
     return constraints, unknown_cells
 
@@ -181,6 +181,11 @@ def deductions(cells: list[list[Any]], mines_remaining: int | None = None,
     mines: set[tuple[int, int]] = set()
     known_mines = known_mines or set()
     constraints, unknown_cells = _build_constraints(cells, known_mines)
+    for hidden, remaining in constraints:
+        if remaining < 0 or remaining > len(hidden):
+            # A stale board, incorrect prior flag, or incorrect virtual mine
+            # makes every deduction based on this snapshot unsafe.
+            return set(), set()
 
     # Repeatedly apply direct rules and A⊂B subtraction. This handles cases
     # where no single number has a complete mine/safe neighborhood but the
@@ -249,7 +254,9 @@ def deductions(cells: list[list[Any]], mines_remaining: int | None = None,
             unknown_cells)
         safe.update(global_safe)
         mines.update(global_mines)
-    safe.difference_update(mines)
+    conflict = safe & mines
+    safe.difference_update(mines | conflict)
+    mines.difference_update(conflict)
     return safe, mines
 
 
@@ -258,6 +265,9 @@ def exact_probabilities(cells: list[list[Any]], mines_remaining: int,
                         ) -> dict[tuple[int, int], float]:
     """Return exact frontier probabilities when the component search fits."""
     constraints, unknown_cells = _build_constraints(cells, known_mines)
+    if any(remaining < 0 or remaining > len(hidden)
+           for hidden, remaining in constraints):
+        return {}
     _, _, probabilities = _global_csp_forced_cells(
         constraints, set(), set(), mines_remaining, unknown_cells,
         with_probabilities=True)
