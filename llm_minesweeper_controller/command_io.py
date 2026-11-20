@@ -142,7 +142,8 @@ class CommandIO:
                 self._context = None
 
     def _exchange(self, payload: bytes, request_id: str, timeout: float,
-                  pre_send: Callable[[], object] | None = None) -> bytes:
+                  pre_send: Callable[[], object] | None = None,
+                  batch_clicks: list[dict] | None = None) -> bytes:
         """在 I/O owner 线程发送并等待匹配的响应帧"""
         if threading.current_thread() is not self.thread:
             raise RuntimeError(
@@ -168,7 +169,18 @@ class CommandIO:
                         self._socket.send(payload, flags=zmq.NOBLOCK)
                     except zmq.Again as error:
                         raise CommandNotSentError("Transport backpressure; command not sent") from error
-                    if pre_send is not None and call.progress is not None:
+                    if (pre_send is not None and call.progress is not None
+                            and batch_clicks is not None):
+                        progress = call.progress
+                        error = "Batch sent without confirmation; do not retry automatically"
+                        progress["results"] = [
+                            {"index": index, **click,
+                             "button": click.get("button", "left"),
+                             "success": False, "outcome": "unknown", "error": error}
+                            for index, click in enumerate(batch_clicks)]
+                        progress.update(success=False, outcome="unknown", completed=0,
+                                        stopped_index=0, unattempted=0, error=error)
+                    elif pre_send is not None and call.progress is not None:
                         progress = call.progress
                         index = progress["completed"]
                         click = call.arguments["clicks"][index]
@@ -203,6 +215,25 @@ class CommandIO:
                         and time.monotonic() < deadline and not call.future.done()
                         and not self.stopped.is_set()):
                     if (pre_send is not None and call.progress is not None
+                            and batch_clicks is not None
+                            and isinstance(response, CommandResponse)):
+                        progress = call.progress
+                        if response.success:
+                            for entry in progress["results"]:
+                                entry.update(success=True, outcome="confirmed",
+                                             request_id=response.request_id)
+                                entry.pop("error", None)
+                            progress.update(success=True, outcome="confirmed",
+                                            completed=progress["requested"],
+                                            stopped_index=None, unattempted=0)
+                            progress.pop("error", None)
+                        else:
+                            error = response.error or "Batch response did not identify which cells were executed"
+                            for entry in progress["results"]:
+                                entry.update(success=False, outcome="unknown", error=error)
+                            progress.update(success=False, outcome="unknown", completed=0,
+                                            stopped_index=0, unattempted=0, error=error)
+                    elif (pre_send is not None and call.progress is not None
                             and isinstance(response, CommandResponse)):
                         progress = call.progress
                         entry = progress["results"][-1]
@@ -236,7 +267,13 @@ class CommandIO:
 
         try:
             raw = self._exchange(payload, command.request_id,
-                                 timeout, check_authorization)
+                                 timeout, check_authorization,
+                                 batch_clicks=([
+                                     {**click, "button": self.active.arguments.get("button", "left")}
+                                     for click in self.active.arguments.get("clicks", [])]
+                                               if getattr(command, "cells", None) is not None
+                                               and self.active is not None
+                                               and self.active.arguments.get("clicks") else None))
             if raw == b"__blocked__":
                 return CommandResponse(
                     request_id=command.request_id, success=False,

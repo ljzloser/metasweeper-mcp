@@ -61,7 +61,7 @@ if isinstance(result, BoardStateResult) and result.success:
 | `get_board_state` | 无 | 主动请求主进程的可见棋盘快照；失败时回退到最近一次官方事件并标注 `source="cache"` |
 | `get_game_status` | 无 | 主动请求状态、计时、剩余雷数与局面参数；失败时回退到缓存 |
 | `get_game_context` | 无 | 主动请求状态、参数、3BV 进度、官方/公平标志与当前已开启的控制权限 |
-| `click_cell` | `clicks` 数组，或原有 `row`, `col`, `button="left"` | 单次最多 128 项；行列从零开始；按钮限 `left`、`middle`、`right` |
+| `click_cell` | `clicks` 数组和批次级 `button`，或单个 `row`, `col`, `button` | 单次最多 128 项；行列从零开始；按钮限 `left`、`middle`、`right` |
 | `start_new_game` | `difficulty="medium"` | 难度限 `easy`、`medium`、`hard` |
 
 ### 批量点击
@@ -74,27 +74,28 @@ if isinstance(result, BoardStateResult) and result.success:
   "arguments": {
     "clicks": [
       {"row": 0, "col": 1},
-      {"row": 2, "col": 3, "button": "right"},
-      {"row": 4, "col": 5, "button": "middle"}
-    ]
+      {"row": 2, "col": 3},
+      {"row": 4, "col": 5}
+    ],
+    "button": "left"
   }
 }
 ```
 
-旧参数 `{"row": 0, "col": 1, "button": "left"}` 仍可用，但不能与 `clicks` 混用。
+单格参数 `{"row": 0, "col": 1, "button": "left"}` 仍可用，但不能与 `clicks` 混用。
 数组必须有 1..128 项；所有项的字段、类型、按钮及初始棋盘边界均在首次点击前完整预检。
-批量必须获得实时可见棋盘，不能用缓存代替。每项按顺序重新检查状态和授权，发送原有
-`MouseClickCommand` 并等待匹配的 `CommandResponse`；下一项前再次刷新棋盘。
+批量必须获得实时可见棋盘，不能用缓存代替。批次只指定一个按钮，插件将所有坐标放入一个
+`MouseClickCommand.cells` 并等待唯一的 `CommandResponse`。
 
-结果中的 `requested` 为请求项数，`completed` 只统计主进程明确确认成功的项；`results`
-按顺序保留逐项结果，`stopped_index` 是首个未确认成功项的零基下标，全部成功时为 `null`。
-`unattempted` 表示尚未进入逐项结果的后续项数；明确拒绝或本地阻止的项可能已包含在
-`results` 内，但不会计入 `completed`。预检失败和排队取消时完成数为零、结果为空。
+结果中的 `requested` 为坐标数，`completed` 只在主进程确认整个批量命令成功时等于请求数；
+`results` 按坐标顺序呈现结果。批量命令只有一个主进程响应，若响应失败或超时，主进程没有
+提供部分执行位置，因此所有坐标标记为 `unknown`，`completed` 为零且 `stopped_index` 为零。
+批量发送后 `unattempted` 为零，因为各坐标是否已经执行无法确认；预检失败时结果为空，
+`unattempted` 等于请求数。全部成功为 `outcome="confirmed"`，预检失败为 `not_executed`。
 
-首个失败、确认未知、取消、会话关闭、服务停止、授权撤回、实时棋盘不可用、对局结束，
-或观察到棋盘失效、尺寸变化、计时回退、回到准备状态时停止。部分完成为 `outcome="partial"`，
-发送后无有效确认则为 `unknown`，全部成功为 `confirmed`，没有执行为 `not_executed`。
-取消与响应确认通过同一把锁协调；停止时保留已接受的确认，不能将“已发送”计为完成。
+批量必须先获得实时棋盘、通过全部坐标预检并具有 SDK 授权。主进程按序执行同一个命令中的
+坐标，并在首个失败时停止；MCP 不会自动重试或续跑。响应未知时先检查 `results`，不要重复
+发送整批，以免重复执行已经发生的点击。
 
 **不是原子事务**：已经确认的点击不回滚，已经发送的点击无法撤回，不自动重试或续跑。
 批次仍受工具总期限八秒约束，不会按项延长期限；大批次也可能只完成一部分。
@@ -194,7 +195,7 @@ HTTP 线程只解析协议和等待结果，不直接访问 GUI、棋盘或共�
 
 **通信审查边界：** 私有 I/O 线程不修复项目其他插件共享 `ZMQClient` 的线程所有权风险。
 真实主进程与 agent 客户端互操作、断连及停止时序仍需通信专家实机审查。
-本次批量功能不修改 SDK、ZMQ 库、共享类型或主进程协议，也未启动真实游戏控制。
+本次 MCP 改动使用主进程已有的 `MouseClickCommand.cells` 批量协议，也未启动真实游戏控制。
 
 **跨进程竞态：** “不覆盖进行中游戏”检查基于最新收到的官方状态事件。现有 `NewGameCommand`
 不支持主进程原子检查期望状态或棋盘版本，故事件延迟或用户同时开始游戏时仍存在竞态；

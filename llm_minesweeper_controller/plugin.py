@@ -107,8 +107,8 @@ class LlmMinesweeperControllerPlugin(BasePlugin[LlmMinesweeperControllerConfig])
                 "若客户端不支持 Streamable HTTP，明确报告不支持，不能改用 stdio。"
                 "不启动子进程或新游戏，不自动玩游戏。连接后等待用户明确指令。"
                 "只读取可见棋盘，控制需用户重新授权并开启主进程相应开关。"
-                "click_cell 支持 clicks 数组批量点击（最多128项），也兼容 row/col/button 单点。"
-                "批量按顺序逐项确认，首个失败即停止；先检查 completed/results/stopped_index。"
+                "click_cell 支持 clicks 数组和批次级 button（最多128项），也兼容 row/col/button 单点。"
+                "批量会作为一个 MouseClickCommand 一次发送；先检查 completed/results/stopped_index。"
                 "动作超时意味着结果未知，不得自动重试。"
             ).format(endpoint=endpoint)
         self.service_state_changed.emit({

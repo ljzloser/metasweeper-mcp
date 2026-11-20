@@ -36,8 +36,8 @@ MAX_BATCH_CLICKS = 128
 CLICK_PROPERTIES = {
     "row": {"type": "integer", "minimum": 0},
     "col": {"type": "integer", "minimum": 0},
-    "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
 }
+BUTTON_PROPERTY = {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}
 
 TOOLS = [
     {"name": "get_board_state", "description": "Actively request the current visible board snapshot. Falls back to the last official event with source=cache when the live request fails.",
@@ -49,9 +49,10 @@ TOOLS = [
     {"name": "get_game_context", "description": "Actively request the game context: status, board parameters, 3BV progress, official/fair flags and currently enabled control permissions.",
      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
      "annotations": {"readOnlyHint": True, "openWorldHint": False}},
-    {"name": "click_cell", "description": "Click one cell (row, col, button) or submit clicks for an ordered batch. Validate all inputs before any click; refresh the visible board and check SDK permission for each action. Stop on the first failure, unknown confirmation or unavailable/finished/changed board. Never retry automatically; inspect completed, results and stopped_index before continuing.",
+    {"name": "click_cell", "description": "Click one cell or submit an ordered batch. A batch uses one top-level button for every cell and is sent as one host command. Validate all inputs before execution; refresh the visible board and check SDK permission. Never retry automatically; inspect completed, results and stopped_index before continuing.",
      "inputSchema": {"type": "object", "properties": {
          **CLICK_PROPERTIES,
+         "button": BUTTON_PROPERTY,
          "clicks": {"type": "array", "minItems": 1, "maxItems": MAX_BATCH_CLICKS,
                     "items": {"type": "object", "properties": CLICK_PROPERTIES,
                               "required": ["row", "col"], "additionalProperties": False}}},
@@ -157,7 +158,8 @@ class MinesweeperTools:
                 return failure("No actionable visible board; wait for SDK events")
             if not (0 <= row < self.board["rows"] and 0 <= col < self.board["cols"]):
                 return failure("Coordinates out of bounds")
-            return MouseClickCommand(row=row, col=col, button={"left": 0, "middle": 1, "right": 2}[button])
+            return MouseClickCommand(row=row, col=col, button={"left": 0, "middle": 1, "right": 2}[button],
+                                     cells=[(row, col)])
         if name == "start_new_game":
             if set(arguments) - {"difficulty"}:
                 return failure("Expected optional difficulty only")
@@ -289,60 +291,88 @@ class MinesweeperTools:
 
     def _execute_click_batch(self, arguments: dict) -> dict:
         clicks = arguments["clicks"]
-        if (set(arguments) != {"clicks"} or not isinstance(clicks, list)
+        if (set(arguments) - {"clicks", "button"} or not isinstance(clicks, list)
                 or not 1 <= len(clicks) <= MAX_BATCH_CLICKS):
             return {**self._batch_result(clicks if isinstance(clicks, list) else [], []),
                 **failure(f"Expected clicks only: an array of 1..{MAX_BATCH_CLICKS} cell objects")}
         clicks = copy.deepcopy(clicks)
+        button = arguments.get("button", "left")
+        if not isinstance(button, str) or button not in ("left", "right", "middle"):
+            return {**self._batch_result(clicks, []),
+                    **failure("Unknown button; use left, right, or middle")}
         for index, click in enumerate(clicks):
-            if (not isinstance(click, dict) or set(click) - {"row", "col", "button"}
+            if (not isinstance(click, dict) or set(click) - {"row", "col"}
                     or not {"row", "col"} <= click.keys()
                     or type(click["row"]) is not int or type(click["col"]) is not int
-                    or click["row"] < 0 or click["col"] < 0
-                    or not isinstance(click.get("button", "left"), str)
-                    or click.get("button", "left") not in ("left", "right", "middle")):
+                    or click["row"] < 0 or click["col"] < 0):
                 return {**self._batch_result(clicks, []),
                         **failure(f"Invalid click at index {index}; no clicks executed"),
                         "invalid_index": index}
-        results = []
+        return self._execute_uniform_click_batch(clicks, button)
+
+    def _execute_uniform_click_batch(self, clicks: list[dict], button: str) -> dict:
+        """Send a same-button batch as one command and conservatively report it."""
+        results: list[dict] = []
         self._publish_batch_progress(clicks, results)
         if not self.refresh_state():
             return {**self._batch_result(clicks, results),
                     "error": "Batch requires a fresh live visible board; no clicks executed"}
         with self.lock:
-            if self.board is None:
+            if self.board is None or self.status not in (1, 2):
                 return {**self._batch_result(clicks, results),
                         "error": "No actionable visible board; no clicks executed"}
+            if len(clicks) > self.board["rows"] * self.board["cols"]:
+                return {**self._batch_result(clicks, results),
+                        "error": "Batch size exceeds the visible board capacity; no clicks executed"}
             for index, click in enumerate(clicks):
                 prepared = self._prepare("click_cell", click)
                 if isinstance(prepared, dict):
                     return {**self._batch_result(clicks, results), **prepared,
                             "invalid_index": index}
-            shape = (self.board["rows"], self.board["cols"])
-            epoch, game_time = self.board_epoch, self.board["game_time"]
-            left_ready = self.status != 1
-        for index, click in enumerate(clicks):
-            blocked = None
-            if index:
-                fresh = self.refresh_state()
-                with self.lock:
-                    if not fresh:
-                        blocked = failure("Fresh live board unavailable; batch stopped")
-                    elif (self.board is None or self.board_epoch != epoch
-                          or shape != (self.board["rows"], self.board["cols"])
-                          or self.board["game_time"] < game_time):
-                        blocked = failure("Board changed or invalidated; batch stopped")
-                    elif self.status == 1 and left_ready:
-                        blocked = failure("Game returned to ready state; batch stopped")
-                    if blocked is None and self.board is not None:
-                        game_time = self.board["game_time"]
-                        left_ready = left_ready or self.status != 1
-            result = blocked if blocked is not None else self.execute_function("click_cell", click)
-            results.append({"index": index, **click, "button": click.get("button", "left"), **result})
+            command = MouseClickCommand(
+                cells=[(click["row"], click["col"]) for click in clicks],
+                button={"left": 0, "middle": 1, "right": 2}[button])
+            if not self.has_auth(type(command)):
+                return {**self._batch_result(clicks, results),
+                        **failure("Official SDK control permission not granted to this plugin; reauthorize it")}
+            self.board = None
+            revision = self.revision
+        try:
+            # CommandIO records the whole batch as unknown if cancellation
+            # happens after the single host-side command is sent.
+            response = self.request(command, timeout=3.0)
+        except Exception as error:
+            response = (CommandResponse(request_id=command.request_id, success=False, error=str(error))
+                        if getattr(error, "send_state", None) == "not_sent" else None)
+        if not isinstance(response, CommandResponse) or type(response.success) is not bool:
+            with self.lock:
+                if self.revision == revision:
+                    self.status = None
+                    self.revision += 1
+            results = [{"index": index, **click, "button": button,
+                        "success": False, "outcome": "unknown",
+                        "error": "Batch command has no valid confirmation; do not retry automatically"}
+                       for index, click in enumerate(clicks)]
             self._publish_batch_progress(clicks, results)
-            if not result["success"]:
-                break
-        return self._batch_result(clicks, results)
+            return {**self._batch_result(clicks, results), "outcome": "unknown",
+                    "stopped_index": 0, "unattempted": 0,
+                    "error": results[0]["error"]}
+        if response.success:
+            results = [{"index": index, **click, "button": button,
+                        "success": True, "outcome": "confirmed",
+                        "request_id": response.request_id}
+                       for index, click in enumerate(clicks)]
+            self._publish_batch_progress(clicks, results)
+            return self._batch_result(clicks, results)
+        # The host only returns one boolean for the whole command. It may have
+        # stopped partway through, so a rejection cannot identify safe retries.
+        error = response.error or "Main process rejected or partially executed batch; result unknown"
+        results = [{"index": index, **click, "button": button,
+                    "success": False, "outcome": "unknown", "error": error}
+                   for index, click in enumerate(clicks)]
+        self._publish_batch_progress(clicks, results)
+        return {**self._batch_result(clicks, results), "outcome": "unknown",
+                "stopped_index": 0, "unattempted": 0, "error": error}
 
     def execute_function(self, name: str, arguments: dict) -> dict:
         if name == "click_cell" and isinstance(arguments, dict) and "clicks" in arguments:
