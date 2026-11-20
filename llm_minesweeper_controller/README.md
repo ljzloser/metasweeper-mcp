@@ -147,7 +147,7 @@ if isinstance(result, BoardStateResult) and result.success:
   不开放 CORS，不允许转发代理、任意 Host 或通配 Origin，拒绝重复安全头及 Transfer-Encoding。
 - 最多八个 HTTP 连接及八个排队请求，超过连接限制直接关闭额外连接；最多 32 个会话。
   会话可通过 DELETE 释放；空闲一小时后，在下一次会话检查或初始化时自动回收，客户端需重新初始化。
-  POST/DELETE 全局每秒最多 32 次，超额返回 429。
+  POST/DELETE 全局每秒最多 1000 次，超额返回 429。
 - 请求体最多 64 KiB，解析后的请求头最多 16 KiB，棋盘最多 65536 格。
   请求头与正文总读取期限三秒，响应写入期限三秒，SDK 等待三秒，工具总等待八秒。
 

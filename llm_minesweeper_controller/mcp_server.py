@@ -15,6 +15,7 @@ from typing import Callable, cast
 PROTOCOL_VERSION = "2025-11-25"
 MAX_BODY = 64 * 1024
 MAX_CONNECTIONS = 8
+MAX_REQUESTS_PER_SECOND = 1000
 IO_TIMEOUT = 3.0
 CALL_TIMEOUT = 8.0
 STOP_TIMEOUT = 1.0
@@ -325,7 +326,7 @@ class McpServer:
         with self.lock:
             while self.arrivals and self.arrivals[0] < now - 1.0:
                 self.arrivals.popleft()
-            if len(self.arrivals) >= 32:
+            if len(self.arrivals) >= MAX_REQUESTS_PER_SECOND:
                 return False
             self.arrivals.append(now)
             return True

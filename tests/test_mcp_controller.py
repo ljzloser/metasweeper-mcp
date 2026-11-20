@@ -1247,7 +1247,7 @@ def test_initialize_negotiation_and_notifications_do_not_execute(http_service):
 def test_rate_limit_and_port_release(http_service):
     server = http_service[0]
     with server.lock:
-        server.arrivals.extend([time.monotonic()] * 32)
+        server.arrivals.extend([time.monotonic()] * mcp_server.MAX_REQUESTS_PER_SECOND)
     assert http_request(server, {})[0] == 429
     port = server.port
     server.stop()
